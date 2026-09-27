@@ -1,4 +1,5 @@
 import pandas as pd
+import psycopg2
 import streamlit as st
 
 # Page Configuration
@@ -7,39 +8,39 @@ st.set_page_config(
 )
 
 
-# Initialize Database connection using Streamlit's connection manager
-def get_connection():
-  # This connects to Supabase using the secrets.toml configuration
-  return st.connection("supabase", type="sql")
+# Get direct connection from Streamlit secrets
+def get_conn():
+  db_url = st.secrets["connections"]["supabase"]["url"]
+  return psycopg2.connect(db_url)
 
 
 def init_db():
-  conn = get_connection()
-  # Create tables in PostgreSQL (Supabase) if they don't exist
-  with conn.session as s:
-    s.execute("""
-            CREATE TABLE IF NOT EXISTS chapters (
-                chapter_id SERIAL PRIMARY KEY,
-                chapter_name TEXT UNIQUE,
-                subject TEXT
-            );
-        """)
-    s.execute("""
-            CREATE TABLE IF NOT EXISTS daily_practice_v2 (
-                day_num INT,
-                date_or_context TEXT,
-                chapter_name TEXT,
-                questions_solved INT,
-                PRIMARY KEY (day_num, chapter_name)
-            );
-        """)
-    s.commit()
+  conn = get_conn()
+  cursor = conn.cursor()
+  cursor.execute("""
+        CREATE TABLE IF NOT EXISTS chapters (
+            chapter_id SERIAL PRIMARY KEY,
+            chapter_name TEXT UNIQUE,
+            subject TEXT
+        );
+    """)
+  cursor.execute("""
+        CREATE TABLE IF NOT EXISTS daily_practice_v2 (
+            day_num INT,
+            date_or_context TEXT,
+            chapter_name TEXT,
+            questions_solved INT,
+            PRIMARY KEY (day_num, chapter_name)
+        );
+    """)
+  conn.commit()
+  cursor.close()
+  conn.close()
 
 
 def main():
   st.title("🎯 Solo System: Advanced Study & Chapter Progress Tracker")
   init_db()
-  conn = get_connection()
 
   # Create Tabs for Clean Separation
   tab1, tab2, tab3 = st.tabs(
@@ -64,37 +65,45 @@ def main():
 
       if submitted and c_name.strip():
         try:
-          with conn.session as s:
-            s.execute(
-                "INSERT INTO chapters (chapter_name, subject) VALUES (:name,"
-                " :subj) ON CONFLICT (chapter_name) DO NOTHING;",
-                {"name": c_name.strip(), "subj": c_subject},
-            )
-            s.commit()
+          conn = get_conn()
+          cursor = conn.cursor()
+          cursor.execute(
+              "INSERT INTO chapters (chapter_name, subject) VALUES (%s, %s) ON"
+              " CONFLICT (chapter_name) DO NOTHING;",
+              (c_name.strip(), c_subject),
+          )
+          conn.commit()
+          cursor.close()
+          conn.close()
           st.success(f"Added chapter: {c_name.strip()}")
           st.rerun()
         except Exception as e:
           st.error(f"Error adding chapter: {e}")
 
     st.markdown("#### Existing Chapters")
-    df_chapters = conn.query(
-        "SELECT * FROM chapters ORDER BY chapter_id;", ttl=0
+    conn = get_conn()
+    df_chapters = pd.read_sql(
+        "SELECT * FROM chapters ORDER BY chapter_id;", conn
     )
+    conn.close()
+
     if not df_chapters.empty:
       st.dataframe(df_chapters, use_container_width=True)
 
       del_chapter = st.text_input("Enter exact Chapter Name to Delete")
       if st.button("Delete Chapter"):
-        with conn.session as s:
-          s.execute(
-              "DELETE FROM chapters WHERE chapter_name = :name;",
-              {"name": del_chapter},
-          )
-          s.execute(
-              "DELETE FROM daily_practice_v2 WHERE chapter_name = :name;",
-              {"name": del_chapter},
-          )
-          s.commit()
+        conn = get_conn()
+        cursor = conn.cursor()
+        cursor.execute(
+            "DELETE FROM chapters WHERE chapter_name = %s;", (del_chapter,)
+        )
+        cursor.execute(
+            "DELETE FROM daily_practice_v2 WHERE chapter_name = %s;",
+            (del_chapter,),
+        )
+        conn.commit()
+        cursor.close()
+        conn.close()
         st.warning(f"Deleted chapter: {del_chapter}")
         st.rerun()
     else:
@@ -103,9 +112,12 @@ def main():
   # --- TAB 2: DAILY QUESTION LOGGING ---
   with tab2:
     st.markdown("### Log Daily Questions Solved per Chapter")
-    df_chapters_opt = conn.query(
-        "SELECT chapter_name FROM chapters ORDER BY chapter_id;", ttl=0
+    conn = get_conn()
+    df_chapters_opt = pd.read_sql(
+        "SELECT chapter_name FROM chapters ORDER BY chapter_id;", conn
     )
+    conn.close()
+
     chapter_options = (
         df_chapters_opt["chapter_name"].tolist()
         if not df_chapters_opt.empty
@@ -128,33 +140,33 @@ def main():
 
         log_submitted = st.form_submit_button("Save Daily Log Entry")
         if log_submitted:
-          with conn.session as s:
-            # Upsert query for PostgreSQL/Supabase
-            s.execute(
-                """
-                            INSERT INTO daily_practice_v2 (day_num, date_or_context, chapter_name, questions_solved)
-                            VALUES (:day, :ctx, :chap, :q)
-                            ON CONFLICT (day_num, chapter_name) 
-                            DO UPDATE SET questions_solved = daily_practice_v2.questions_solved + :q, date_or_context = :ctx;
-                        """,
-                {
-                    "day": day_n,
-                    "ctx": context,
-                    "chap": selected_chap,
-                    "q": q_count,
-                },
-            )
-            s.commit()
+          conn = get_conn()
+          cursor = conn.cursor()
+          cursor.execute(
+              """
+                        INSERT INTO daily_practice_v2 (day_num, date_or_context, chapter_name, questions_solved)
+                        VALUES (%s, %s, %s, %s)
+                        ON CONFLICT (day_num, chapter_name) 
+                        DO UPDATE SET questions_solved = daily_practice_v2.questions_solved + %s, date_or_context = %s;
+                    """,
+              (day_n, context, selected_chap, q_count, q_count, context),
+          )
+          conn.commit()
+          cursor.close()
+          conn.close()
           st.success(
               f"Logged {q_count} questions for {selected_chap} on Day {day_n}!"
           )
           st.rerun()
 
       st.markdown("#### All Logged Practice Records")
-      df_logs = conn.query(
-          "SELECT day_num AS Day, date_or_context AS Context, chapter_name AS Chapter, questions_solved AS \"Questions Solved\" FROM daily_practice_v2 ORDER BY day_num;",
-          ttl=0,
+      conn = get_conn()
+      df_logs = pd.read_sql(
+          'SELECT day_num AS Day, date_or_context AS Context, chapter_name AS Chapter, questions_solved AS "Questions Solved" FROM daily_practice_v2 ORDER BY day_num;',
+          conn,
       )
+      conn.close()
+
       if not df_logs.empty:
         st.dataframe(df_logs, use_container_width=True)
       else:
@@ -168,7 +180,9 @@ def main():
   # --- TAB 3: OVERALL ANALYTICS ---
   with tab3:
     st.markdown("### 📈 Overall Performance & Chapter Breakdown")
-    df_analytics = conn.query("SELECT * FROM daily_practice_v2;", ttl=0)
+    conn = get_conn()
+    df_analytics = pd.read_sql("SELECT * FROM daily_practice_v2;", conn)
+    conn.close()
 
     if not df_analytics.empty:
       total_q = df_analytics["questions_solved"].sum()
